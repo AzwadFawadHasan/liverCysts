@@ -1,0 +1,111 @@
+BATCH_SIZE = 16
+IMAGE_SIZE = 128
+
+codes = np.array(["background","liver","tumor"])
+    
+def get_x(fname:Path): return fname
+def label_func(x): return path/'train_masks'/f'{x.stem}_mask.png'
+
+tfms = [IntToFloatTensor(),Normalize()]
+
+db = DataBlock(blocks=(ImageBlock(),MaskBlock(codes)),  #codes = {"Backround": 0,"Liver": 1,"Tumor": 2}
+               batch_tfms=tfms,
+               splitter=RandomSplitter(),
+               item_tfms=[Resize(IMAGE_SIZE)],
+               get_items=get_image_files,
+               get_y=label_func)
+
+ds = db.datasets(source=path/'train_images')
+
+idx = 20
+imgs = [ds[idx][0],ds[idx][1]]
+fig, axs = plt.subplots(1, 2)
+
+for i,ax in enumerate(axs.flatten()):
+    ax.axis('off')
+    ax.imshow(imgs[i])
+
+unique, counts = np.unique(array(ds[idx][1]), return_counts=True)
+
+print( np.array((unique, counts)).T)
+
+dls = db.dataloaders(path/'train_images', bs = BATCH_SIZE) #, num_workers=0
+dls.show_batch()
+
+def foreground_acc(inp, targ, bkg_idx=0, axis=1):  # exclude a background from metric
+    "Computes non-background accuracy for multiclass segmentation"
+    targ = targ.squeeze(1)
+    mask = targ != bkg_idx
+    return (inp.argmax(dim=axis)[mask]==targ[mask]).float().mean() 
+
+def cust_foreground_acc(inp, targ):  # # include a background into the metric
+    return foreground_acc(inp=inp, targ=targ, bkg_idx=3, axis=1) # 3 is a dummy value to include the background which is 0
+
+learn = unet_learner(dls,
+                     resnet50,
+                     loss_func=CrossEntropyLossFlat(axis=1),
+                     metrics=[foreground_acc, cust_foreground_acc]) 
+
+learn.fine_tune(5, wd=0.1, cbs=SaveModelCallback() )
+
+
+learn.show_results()
+
+
+# Save the model
+learn.export(path/f'Liver_segmentation')
+
+#testing the model
+
+# Load saved model
+IMAGE_SIZE = 128
+if (GENERATE_JPG_FILES) :
+    
+    tfms = [Resize(IMAGE_SIZE), IntToFloatTensor(),Normalize()]
+    learn0 = load_learner(path/f'Liver_segmentation',cpu=False )
+    learn0.dls.transform = tfms
+
+def nii_tfm(fn,wins): 
+
+    test_nii  = read_nii(fn)
+    curr_dim  = test_nii.shape[2] # 512, 512, curr_dim
+    slices = []
+    
+    for curr_slice in range(curr_dim):
+        data = tensor(test_nii[...,curr_slice].astype(np.float32))
+        data = (data.to_nchan(wins)*255).byte()
+        slices.append(TensorImage(data))
+                      
+    return slices 
+
+
+tst = 20
+
+test_nii   = read_nii(df_files.loc[tst,'dirname']+"/"+df_files.loc[tst,'filename'])
+test_mask  = read_nii(df_files.loc[tst,'mask_dirname']+"/"+df_files.loc[tst,'mask_filename'])
+print(test_nii.shape)
+
+test_slice_idx = 500
+
+sample_slice = tensor(test_nii[...,test_slice_idx].astype(np.float32))
+
+plot_sample([test_nii[...,test_slice_idx], test_mask[...,test_slice_idx]])
+
+
+# Prepare a nii test file for prediction 
+
+test_files = nii_tfm(df_files.loc[tst,'dirname']+"/"+df_files.loc[tst,'filename'],[dicom_windows.liver, dicom_windows.custom])
+print("Number of test slices: ", len(test_files))
+
+# Check an input for a test file
+show_image(test_files[test_slice_idx])
+
+
+# Get predictions for a Test file
+
+test_dl = learn0.dls.test_dl(test_files)
+preds, y = learn0.get_preds(dl=test_dl)
+
+predicted_mask = np.argmax(preds, axis=1)
+
+plt.imshow(predicted_mask[test_slice_idx])
